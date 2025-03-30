@@ -1,0 +1,264 @@
+---
+title: "BIOF520_Assignment4"
+author: "Yuming Shi"
+date: "2025-03-28"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(limma)
+library(ggplot2)
+library(CMA)
+library(pROC)
+library(caret)
+library(Boruta)
+library(survival)
+library(class)
+library(MASS)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(matrixStats)
+```
+
+```{r}
+#load data
+knowles <- readRDS("knowles_matched_TaLG_final.rds")
+UROMOL <- readRDS("UROMOL_TaLG.teachingcohort.rds")
+```
+
+```{r}
+#prepossessing
+str(UROMOL)
+
+#remove na in recurrence
+data_uromol <- UROMOL[!is.na(UROMOL$Recurrence),]
+
+#remove NA in clinical variable: "RFS_time", "Age", "Sex", "Smoking", "Concomitant.CIS", "Tumor.size", "BCG", "EAU.risk"
+data_uromol <- data_uromol[rowSums(!is.na(data_uromol[, c("RFS_time", "Age", "Sex", "Smoking", "Concomitant.CIS", "Tumor.size", "BCG", "EAU.risk")]) == TRUE) == 8,]
+
+```
+
+```{r}
+#data split
+#separate data into training and testing set (4:1)
+set.seed(10)
+train_indices <- createDataPartition(data_uromol$Recurrence, p = 0.8, list = FALSE)
+train_data_uromol <- data_uromol[train_indices, ]
+test_data_uromol <- data_uromol[-train_indices, ]
+```
+
+```{r}
+#data exploring
+#proportion of recurrence
+table(train_data_uromol$Recurrence)
+table(test_data_uromol$Recurrence)
+
+#histogram
+hist(train_data_uromol$exprs)
+hist(test_data_uromol$exprs)
+
+#check if there are NA
+sum(is.na(train_data_uromol$exprs))
+sum(is.na(test_data_uromol$exprs))
+#no NA
+
+```
+
+
+```{r}
+#feature selection
+#clinical feature
+clin_test <- Boruta(Surv(data_uromol$RFS_time, data_uromol$Recurrence)~., data = data_uromol[, c("Age", "Sex", "Smoking", "Concomitant.CIS", "Tumor.size", "BCG", "EAU.risk")])
+clin_select <- getSelectedAttributes(clin_test)
+#age, sex, BCG, EAU risk are significant contributor
+```
+
+```{r}
+#feature selection
+#RNA-seq data
+#factorize recurrence
+data_uromol$Recurrence <- as.factor(data_uromol$Recurrence)
+expression <- t(data_uromol$exprs)
+
+#which gene contribute to recurrence difference
+design <- model.matrix(~ 0 + Recurrence, data = data_uromol)
+fit <- lmFit(expression, design)
+con <- makeContrasts(Recurrence1 - Recurrence0, levels = design)
+fit.con <- contrasts.fit(fit, con)
+bayes <- eBayes(fit.con)
+result <- topTable(bayes, sort.by = "none", n = Inf, adjust = "BH")
+sig <- result[result$adj.P.Val < 0.1,]
+gene_select <- rownames(sig)
+
+#subset data
+data_sel <- data_uromol[,c("Recurrence", "RFS_time", "Age", "Sex", "BCG", "EAU.risk", "exprs")]
+data_sel <- data_uromol[,c("Recurrence","exprs")]
+data_sel$exprs <- data_sel$exprs[, colnames(data_sel$exprs) %in% gene_select]
+data_sel <- data_sel[, colnames(data_sel) %in% gene_select]
+
+data_sel$Recurrence <- as.character(data_sel$Recurrence)
+data_sel$Recurrence[data_sel$Recurrence == 1] <- TRUE
+data_sel$Recurrence[data_sel$Recurrence == 0] <- FALSE
+
+```
+
+
+```{r}
+#model picking
+n_runs <- 10 # Number of CV runs
+
+#result storage
+run_results <- matrix(0, n_runs, 6,
+                     dimnames = list(paste("Run", 1:n_runs, sep = ""),
+                     c("5NN","10NN","15NN","LDA", "RF", "xgb")))
+
+for(i in 1:n_runs){
+  pr.err <- matrix(-1, 6, 6, 
+                   dimnames = list(paste("Fold",1:6, sep = ""),
+                  c("5NN","10NN","15NN","LDA","RF", "xgb")))
+
+  
+  # split data into 6 folds for cross-validation
+  folds <- createFolds(data_sel$Recurrence, k = 6, list = TRUE)
+
+  # Access each fold
+  for (j in 1:6) {
+    train_indices <- unlist(folds[-j])  # Combine all but the i-th fold for training
+    test_indices <- unlist(folds[j])   # Use the i-th fold for testing
+  
+    train_data <- data_sel[train_indices, -1]
+    test_data <- data_sel[test_indices, -1]
+  
+    colnames(train_data) <- make.names(colnames(train_data))
+    colnames(test_data) <- make.names(colnames(test_data))
+    
+    trainclass.fold <- data_sel$Recurrence[train_indices]
+    testclass.fold <- data_sel$Recurrence[test_indices]
+    
+    print(paste("Fold", j, "Train size:", nrow(train_data), "Test size:", nrow(test_data)))
+    
+    #select a classifier
+    l <- 0
+    #kNN classifiers
+    for(kk in c(5,10,15)) {
+      l <- l + 1
+      #knn needs samples in rows
+      pr.knn <- knn(train = train_data, test = test_data, 
+                    cl = trainclass.fold, k = kk)
+      #Store the prediction error for each kk within this fold
+      pr.err[j,l]<- mean(testclass.fold != pr.knn)
+    } 
+    
+    #LDA method
+    m.lda <- lda(x = train_data, group = trainclass.fold, prior = c(.5, .5))
+    pr.lda <- predict(m.lda, newdata = train_data)$class
+    pr.err[j,"LDA"] <- mean(testclass.fold != pr.lda)
+
+    #random forest
+    m.rf <- randomForest(trainclass.fold ~ .,
+                          data = train_data,
+                          ntree = 500,        # Number of trees
+                          mtry = sqrt(ncol(train_data)-1),  # Variables per split
+                          importance = TRUE)  # Track variable importance
+    pr.rf <- predict(m.rf, newdata = test_data)
+    # Calculate error
+    pr.err[j, "RF"] <- mean(pr.rf != testclass.fold)
+    
+    #xgboost
+    # Create DMatrix for XGBoost
+    dtrain <- xgb.DMatrix(data = train_data, label = as.numeric(trainclass.fold)-1)
+    dtest <- xgb.DMatrix(data = test_data, label = as.numeric(testclass.fold)-1)
+    # Set XGBoost parameters
+    params <- list(
+      booster = "gbtree",
+      objective = "binary:logistic",   # Binary classification
+      eta = 0.1,                      # Learning rate
+      max_depth = 6,                  # Maximum tree depth
+      eval_metric = "error"           # Evaluation metric: classification error
+    )
+  
+    # Train the XGBoost model
+    m.xgb <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 100,                  # Number of boosting rounds
+      verbose = FALSE
+    )
+  
+    # Make predictions on the test set
+    pr.probs <- predict(m.xgb, newdata = dtest)
+    pr.xgb <- ifelse(pr.probs > 0.5, 1, 0)   # Convert probabilities to binary classes
+  
+    # Calculate prediction error for this fold
+    pr.err[j, "xgb"] <- mean(pr.xgb != as.numeric(testclass.fold)-1)
+    
+  }
+  run_results[i,] <- colMeans(pr.err)
+}
+
+
+
+```
+
+```{r}
+#model evaluation
+#summarize result
+cv_err_final <- data.frame(method = colnames(run_results),
+                           mean = colMeans(run_results),
+                           sd = colSds(run_results))
+#barplot to show result
+ggplot(data = cv_err_final, aes(x = method, y = mean, fill = method)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width=.2,
+                position=position_dodge(.9)) +
+  labs(x = "Classifier",
+       y = "Error Rate",
+       fill = "Classifier") +
+  theme_bw()
+ggsave(filename = "error_rate.jpeg",
+       plot = last_plot(),
+       width = 2400, height = 1000, units = "px",
+       dpi = 300)
+
+```
+
+```{r}
+#model performance evaluation
+#ROC and AUC
+roc_5nn <- roc(response = as.numeric(testclass.fold)-1, predictor = as.numeric(pr.knn)-1, levels = c(0, 1))
+roc_rf <- roc(response = as.numeric(testclass.fold)-1, predictor = as.numeric(pr.rf)-1, levels = c(0, 1))
+roc_xgb <- roc(response = as.numeric(testclass.fold)-1, predictor = as.numeric(pr.xgb)-1, levels = c(0, 1))
+
+# Calculate AUC for both models
+auc_5nn <- auc(roc_5nn)
+auc_rf <- auc(roc_rf)
+auc_xgb <- auc(roc_xgb)
+
+ggroc(list("5nn" = roc_5nn, Random_Forest = roc_rf, XGBoost = roc_xgb), legacy.axes = TRUE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +  # Add diagonal line
+  labs(title = "ROC Curve Comparison",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)") +
+  theme_bw() +
+  scale_color_manual(values = c("5nn" = "#4daf4a", "Random_Forest" = "#377eb8", "XGBoost" = "#F564E3"),
+                     label = c("5nn" = paste("5nn", "AUC:", round(auc_5nn, 4), sep = " "),
+                               "Random_Forest" = paste("Random Forest", "AUC:", round(auc_rf, 4), sep = " "),
+                               "XGBoost" = paste("XGBoost", "AUC:", round(auc_xgb, 4), sep = " ")))
+
+ggsave(filename = "roc.jpeg",
+       plot = last_plot(),
+       width = 2400, height = 1500, units = "px",
+       dpi = 300)
+```
+
+
+```{r}
+
+```
